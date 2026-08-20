@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 axum.workspace = true
 base64.workspace = true
+hex.workspace = true
 jsonwebtoken.workspace = true
 ordivon-runtime-core = { version = "=0.1.0", path = "../ordivon-runtime-core" }
 reqwest.workspace = true

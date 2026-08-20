@@ -757,7 +757,7 @@ impl RuntimeServer {
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         let bytes = serde_json::to_vec(&tools)
             .expect("Tool catalog serialization is infallible for generated schemas");
-        format!("sha256:{:x}", Sha256::digest(bytes))
+        format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
     }
 
     pub(crate) fn discovery_result(&self) -> DiscoverResult {
