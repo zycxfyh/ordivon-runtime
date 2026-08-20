@@ -5,8 +5,10 @@ import argparse
 import json
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import stat
+import subprocess
 import sys
 import time
 from typing import Any
@@ -16,6 +18,8 @@ MAPPING_VERSION = "runtime-observation-v1"
 PROJECT_ID = "ordivon-runtime"
 COMPONENT_ID = "runtime-registry"
 SCHEMA_VERSION = 4
+DEFAULT_REGISTRY_ROOT = Path("/var/lib/ordivon/registry")
+DEFAULT_OBSERVATION_ROOT = Path("/var/lib/ordivon/observation/exporters/runtime-registry")
 
 
 class RuntimeObservationExportError(RuntimeError):
@@ -36,6 +40,50 @@ def _revision(value: str, label: str) -> str:
     if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
         raise ValueError(f"{label} must be an exact 40-character Git revision")
     return value
+
+
+def _default_instance_id() -> str:
+    hostname = socket.gethostname().strip()
+    return hostname or "local"
+
+
+def _git_head(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeObservationExportError(
+            "cannot auto-detect a Git revision; pass --owner-revision and "
+            "--exporter-revision explicitly"
+        )
+    return _revision(result.stdout.strip(), "git revision")
+
+
+def _render_timeline(
+    native_events: tuple[tuple[dict[str, Any], ...], ...],
+) -> str:
+    if not native_events:
+        return "(no Runtime Registry events to export)"
+    lines: list[str] = []
+    for stream in native_events:
+        if not stream:
+            continue
+        lines.append(f"runtime-job:{stream[0]['jobId']}")
+        for row in stream:
+            when = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(row["observedAtMs"] / 1000)
+            )
+            attempt = f" attempt={row['attemptId']}" if row["attemptId"] else ""
+            reason = f" ({row['reasonCode']})" if row["reasonCode"] else ""
+            lines.append(
+                f"  #{row['eventSequence']:>3}  {when}  "
+                f"{row['eventType']}  {row['previousState'] or '-'} -> "
+                f"{row['newState'] or '-'}{reason}{attempt}"
+            )
+    return "\n".join(lines)
 
 
 def _private_directory(path: Path, label: str, *, create: bool) -> Path:
@@ -149,7 +197,14 @@ def _read_events(
     job_limit: int,
     event_limit_per_job: int,
     job_ids: tuple[str, ...],
-) -> tuple[tuple[Any, ...], dict[str, int], int, int]:
+    preview: bool = False,
+) -> tuple[
+    tuple[Any, ...],
+    dict[str, int],
+    int,
+    int,
+    tuple[tuple[dict[str, Any], ...], ...],
+]:
     core = _core()
     connection = _connection(_database(registry_root))
     try:
@@ -177,7 +232,7 @@ def _read_events(
                     "selected Runtime Jobs are absent: " + ", ".join(missing)
                 )
         else:
-            if total_jobs > job_limit:
+            if not preview and total_jobs > job_limit:
                 raise RuntimeObservationExportError(
                     f"Runtime Job count {total_jobs} exceeds bounded job_limit {job_limit}"
                 )
@@ -186,6 +241,7 @@ def _read_events(
                 (job_limit,),
             ).fetchall()
         all_events: list[tuple[Any, ...]] = []
+        all_native: list[tuple[dict[str, Any], ...]] = []
         updates: dict[str, int] = {}
         for job in jobs:
             stream_id = f"runtime-job:{job['job_id']}"
@@ -206,6 +262,7 @@ def _read_events(
                 ),
             ).fetchall()
             mapped: list[Any] = []
+            native_rows: list[dict[str, Any]] = []
             for row in rows:
                 native = {
                     "eventId": row["event_id"],
@@ -227,6 +284,7 @@ def _read_events(
                     "jobCreatedAtMs": int(row["created_at_ms"]),
                     "previousEventId": row["previous_event_id"],
                 }
+                native_rows.append(native)
                 source = core.ObservationSource(
                     project_id=PROJECT_ID,
                     component_id=COMPONENT_ID,
@@ -269,9 +327,10 @@ def _read_events(
                 )
             if mapped:
                 all_events.append(tuple(mapped))
+                all_native.append(tuple(native_rows))
                 updates[stream_id] = mapped[-1].source.sequence
         connection.rollback()
-        return tuple(all_events), updates, len(jobs), total_jobs
+        return tuple(all_events), updates, len(jobs), total_jobs, tuple(all_native)
     finally:
         connection.close()
 
@@ -289,6 +348,8 @@ def export_runtime_observations(
     event_limit_per_job: int = 256,
     job_ids: tuple[str, ...] = (),
     fail_after_bundle: bool = False,
+    dry_run: bool = False,
+    human: bool = False,
 ) -> dict[str, Any]:
     core = _core()
     if not instance_id or instance_id != instance_id.strip():
@@ -325,14 +386,30 @@ def export_runtime_observations(
         producer_identity=producer,
         mapping_version=MAPPING_VERSION,
     )
-    stream_events, updates, job_count, registry_job_count = _read_events(
+    stream_events, updates, job_count, registry_job_count, native_events = _read_events(
         owner_root,
         producer=producer,
         checkpoint=before,
         job_limit=job_limit,
         event_limit_per_job=event_limit_per_job,
         job_ids=selected_job_ids,
+        preview=dry_run or human,
     )
+    if dry_run or human:
+        event_count = sum(len(events) for events in stream_events)
+        preview: dict[str, Any] = {
+            "schemaVersion": 1,
+            "kind": "ordivon.runtime-observation-export-result",
+            "status": "preview",
+            "eventCount": event_count,
+            "streamCount": len(stream_events),
+            "jobCount": job_count,
+            "registryJobCount": registry_job_count,
+            "checkpointDigest": before.integrity_digest,
+        }
+        if human:
+            preview["timeline"] = _render_timeline(native_events)
+        return preview
     if not stream_events:
         return {
             "schemaVersion": 1,
@@ -401,12 +478,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Export bounded Runtime Registry metadata observations"
     )
-    parser.add_argument("--registry-root", type=Path, required=True)
-    parser.add_argument("--instance-id", required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--outbox", type=Path, required=True)
-    parser.add_argument("--owner-revision", required=True)
-    parser.add_argument("--exporter-revision", required=True)
+    parser.add_argument("--registry-root", type=Path)
+    parser.add_argument("--instance-id")
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--outbox", type=Path)
+    parser.add_argument("--owner-revision")
+    parser.add_argument("--exporter-revision")
     parser.add_argument("--exported-at-ms", type=int)
     parser.add_argument("--job-limit", type=int, default=1_000)
     parser.add_argument(
@@ -416,19 +493,38 @@ def _parser() -> argparse.ArgumentParser:
         help="export only this exact Runtime Job; may be repeated",
     )
     parser.add_argument("--event-limit-per-job", type=int, default=256)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preview the export without writing a checkpoint or bundle",
+    )
+    parser.add_argument(
+        "--human",
+        action="store_true",
+        help="render a read-only human event timeline instead of writing a bundle",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    repo_root = Path(__file__).resolve().parents[1]
     try:
+        registry_root = args.registry_root or DEFAULT_REGISTRY_ROOT
+        instance_id = (args.instance_id or "").strip() or _default_instance_id()
+        checkpoint_path = args.checkpoint or (
+            DEFAULT_OBSERVATION_ROOT / "checkpoint.json"
+        )
+        outbox_root = args.outbox or (DEFAULT_OBSERVATION_ROOT / "outbox")
+        owner_revision = args.owner_revision or _git_head(repo_root)
+        exporter_revision = args.exporter_revision or _git_head(repo_root)
         result = export_runtime_observations(
-            registry_root=args.registry_root,
-            instance_id=args.instance_id,
-            checkpoint_path=args.checkpoint,
-            outbox_root=args.outbox,
-            owner_revision=args.owner_revision,
-            exporter_revision=args.exporter_revision,
+            registry_root=registry_root,
+            instance_id=instance_id,
+            checkpoint_path=checkpoint_path,
+            outbox_root=outbox_root,
+            owner_revision=owner_revision,
+            exporter_revision=exporter_revision,
             exported_at_ms=(
                 args.exported_at_ms
                 if args.exported_at_ms is not None
@@ -437,6 +533,8 @@ def main(argv: list[str] | None = None) -> int:
             job_limit=args.job_limit,
             event_limit_per_job=args.event_limit_per_job,
             job_ids=tuple(args.job_id),
+            dry_run=args.dry_run or args.human,
+            human=args.human,
         )
     except (RuntimeObservationExportError, OSError, sqlite3.Error, ValueError) as error:
         print(
@@ -444,7 +542,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
+    if args.human:
+        print(result["timeline"])
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
     return 0
 
 

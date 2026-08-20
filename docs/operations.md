@@ -351,6 +351,54 @@ The dashboard reports elapsed, output-idle, and progress-idle time as mechanical
 
 The JSON schema reports separate `health` and `maintenance` states. The deployment projection names the current `releaseEvent` and `releaseDisposition`; a successful explicit rollback supersedes the forward deployment for installed-artifact truth. Exit code `1` is reserved for operational health failures such as service, deployment, Registry, recovery, exact release-artifact inconsistency, or a rollback whose restored artifact set is known but whose coherent source Commit cannot be proven. Maintenance findings such as a stale dirty Workspace produce top-level `status=attention` but retain exit code `0`; automation must inspect `maintenanceAction` when maintenance policy should gate a workflow. Compatibility observations remain advisory deletion evidence: an unreadable or truncated trace, unknown rollback protocol, or incomplete observation window blocks deletion but does not create a health incident. Exit code `2` remains reserved for an invalid invocation or unreadable mandatory input.
 
+## Observation export
+
+`scripts/observation_export.py` is the Runtime owner's read-only exporter into
+the shared cross-owner Observation Plane. Its contract is
+`ordivon-observation-core`, hosted in `ordivon-computing/packages/ordivon-observation-core`.
+It maps committed `job_events` metadata into Observation envelopes and writes a
+checkpointed export bundle. It never writes the Registry and never exports
+private payload bytes, stdout/stderr, or Workspace snapshots.
+
+The exporter is experimental and has no production consumer wired on this host:
+it is not driven by a timer, and the local Observation gateway is exercised only
+by tests. Use it as a run-once operator tool, not a service.
+
+Install the shared contract once (without it the script fails with a clear
+`ModuleNotFoundError` message):
+
+```bash
+cd /root/projects/ordivon-computing
+uv pip install -e packages/ordivon-observation-core
+```
+
+Run-once usage with defaults — Registry root, instance identity, Git revisions,
+checkpoint, and outbox all resolve automatically:
+
+```bash
+# bounded read-only preview of what WOULD be exported (no checkpoint, no bundle)
+scripts/observation_export.py --dry-run --job-limit 20
+
+# human-readable per-Job event timeline (read-only preview)
+scripts/observation_export.py --human --job-limit 20
+
+# export one exact Job into a checkpointed bundle
+scripts/observation_export.py --job-id <job-id>
+```
+
+Every argument remains explicit when needed (`--registry-root`, `--instance-id`,
+`--checkpoint`, `--outbox`, `--owner-revision`, `--exporter-revision`,
+`--exported-at-ms`, `--job-limit`, `--event-limit-per-job`). Defaults are:
+Registry root `/var/lib/ordivon/registry`, checkpoint and outbox under
+`/var/lib/ordivon/observation/exporters/runtime-registry/`, owner and exporter
+revisions from this repository's `HEAD`, and instance identity from the
+hostname.
+
+A real export fails closed when the Registry holds more jobs than `--job-limit`
+(default 1000) and no `--job-id` is given, so a bounded export never silently
+omits jobs. `--dry-run` and `--human` instead report the full job count and
+render a bounded sample, so they remain usable against a large Registry.
+
 ## Real-system release acceptance
 
 Portable CI proves source, schema, Registry, protocol, operational-script, documentation, dependency, and secret-scanning contracts. It cannot prove the production systemd/cgroup path.

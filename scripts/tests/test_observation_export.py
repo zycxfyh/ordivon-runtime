@@ -224,6 +224,8 @@ class RuntimeObservationExporterTests(unittest.TestCase):
         fail_after_bundle: bool = False,
         exported_at_ms: int = 2_000,
         job_ids: tuple[str, ...] = (),
+        dry_run: bool = False,
+        human: bool = False,
     ) -> dict[str, object]:
         root = Path(directory)
         return runtime_export.export_runtime_observations(
@@ -238,6 +240,8 @@ class RuntimeObservationExporterTests(unittest.TestCase):
             event_limit_per_job=event_limit_per_job,
             job_ids=job_ids,
             fail_after_bundle=fail_after_bundle,
+            dry_run=dry_run,
+            human=human,
         )
 
     def test_per_job_streams_metadata_only_gateway_and_replay(self) -> None:
@@ -413,6 +417,102 @@ class RuntimeObservationExporterTests(unittest.TestCase):
                     exporter_revision=EXPORTER_REVISION,
                     exported_at_ms=2_000,
                 )
+
+    def test_dry_run_preview_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.create_registry(root / "registry")
+            before = database.read_bytes()
+            result = self.run_export(directory, dry_run=True)
+            self.assertEqual(result["status"], "preview")
+            self.assertEqual(result["eventCount"], 3)
+            self.assertEqual(result["streamCount"], 2)
+            self.assertEqual(result["jobCount"], 2)
+            self.assertEqual(result["registryJobCount"], 2)
+            self.assertEqual(database.read_bytes(), before)
+            self.assertFalse((root / "sidecar" / "runtime.json").exists())
+            self.assertEqual(len(tuple((root / "outbox").glob("bundle-*.json"))), 0)
+
+    def test_dry_run_previews_large_registry_without_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.create_registry(root / "registry")
+            before = database.read_bytes()
+            result = self.run_export(directory, job_limit=1, dry_run=True)
+            self.assertEqual(result["status"], "preview")
+            self.assertEqual(result["jobCount"], 1)
+            self.assertEqual(result["registryJobCount"], 2)
+            self.assertEqual(result["streamCount"], 1)
+            self.assertEqual(result["eventCount"], 2)
+            self.assertEqual(database.read_bytes(), before)
+            self.assertFalse((root / "sidecar" / "runtime.json").exists())
+            self.assertEqual(len(tuple((root / "outbox").glob("bundle-*.json"))), 0)
+
+    def test_human_preview_returns_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_registry(root / "registry")
+            result = self.run_export(directory, human=True)
+            self.assertEqual(result["status"], "preview")
+            self.assertIn("timeline", result)
+            timeline = str(result["timeline"])
+            self.assertIn(
+                "runtime-job:job-019fd000-0000-7000-8000-000000000001", timeline
+            )
+            self.assertIn("JOB_ACCEPTED", timeline)
+            self.assertIn("ATTEMPT_RUNNING", timeline)
+            self.assertFalse((root / "sidecar" / "runtime.json").exists())
+            self.assertEqual(len(tuple((root / "outbox").glob("bundle-*.json"))), 0)
+
+
+class RuntimeObservationExportHelpersTests(unittest.TestCase):
+    def test_default_instance_id_nonempty(self) -> None:
+        value = runtime_export._default_instance_id()
+        self.assertTrue(value)
+        self.assertEqual(value, value.strip())
+
+    def test_git_head_is_40_char_revision(self) -> None:
+        value = runtime_export._git_head(REPO)
+        self.assertEqual(len(value), 40)
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in value))
+
+    def test_render_timeline_empty(self) -> None:
+        self.assertEqual(
+            runtime_export._render_timeline(()),
+            "(no Runtime Registry events to export)",
+        )
+
+    def test_render_timeline_orders_events_per_job(self) -> None:
+        native = (
+            (
+                {
+                    "jobId": "job-a",
+                    "eventSequence": 1,
+                    "observedAtMs": 1_000,
+                    "eventType": "JOB_ACCEPTED",
+                    "previousState": None,
+                    "newState": "accepted",
+                    "reasonCode": "REQUEST_ADMITTED",
+                    "attemptId": None,
+                },
+                {
+                    "jobId": "job-a",
+                    "eventSequence": 2,
+                    "observedAtMs": 1_002,
+                    "eventType": "ATTEMPT_RUNNING",
+                    "previousState": "accepted",
+                    "newState": "running",
+                    "reasonCode": "RUNNER_OBSERVED",
+                    "attemptId": "attempt-a",
+                },
+            ),
+        )
+        text = runtime_export._render_timeline(native)
+        self.assertIn("runtime-job:job-a", text)
+        self.assertIn("JOB_ACCEPTED", text)
+        self.assertIn("ATTEMPT_RUNNING", text)
+        self.assertIn("attempt=attempt-a", text)
+        self.assertLess(text.index("JOB_ACCEPTED"), text.index("ATTEMPT_RUNNING"))
 
 
 if __name__ == "__main__":
